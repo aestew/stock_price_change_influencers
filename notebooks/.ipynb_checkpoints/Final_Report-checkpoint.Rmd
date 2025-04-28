@@ -1,0 +1,944 @@
+---
+title: 'Lab 2: Market Cap Influences following the Trump Inauguration'
+author: "Amy Steward, Kristen Lin, Chad Adelman, Karim Mattar"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, echo=FALSE, output = FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load packages, echo=FALSE, output = FALSE, include=FALSE}
+#install.packages("GGally")
+#install.packages("psych")
+
+library(zoo)
+library(lmtest)
+library(sandwich)
+library(stargazer)
+library(tidyverse)
+library(ggplot2)
+library(GGally)
+library(psych)
+library(gridExtra)
+library(car)
+library(e1071)
+library(patchwork)
+```
+
+```{r Data Exploration and Removal of NaNs,echo=FALSE, output = FALSE, include=FALSE}
+# Initial dataset and exploration
+data_russell <- read_csv("~/lab-2-maroonp005/data/raw/russell3000_final.csv", show_col_types=FALSE)
+
+# Counting columns where data is not null
+colSums(!is.na(data_russell))
+
+# Checking for stocks with incomplete data - 3 cases (HAS, MOS, HSIC)
+data_russell[!complete.cases(data_russell),]
+
+# Remove stocks with N/A in any columns
+cleaned_russell <- na.omit(data_russell)
+
+# Additional checks
+summary(cleaned_russell$delta_adj_close)
+any(is.infinite(cleaned_russell$delta_adj_close)) # Checks for infinity values in delta_adj_close
+subset(cleaned_russell, delta_adj_close == 0) # Checks for values where delta_adj_close = 0
+```
+
+```{r Data Exploration on Sectors, echo=FALSE, output = FALSE, include=FALSE}
+## create a pivot table to look at sector
+
+sector <- cleaned_russell %>%
+  group_by(sector,cap_size) %>%
+  summarize(total = n(), .groups = "drop") %>%
+  pivot_wider(names_from = sector, values_from = total, values_fill = 0)
+
+print(sector)
+
+
+# Convert to table
+sector_tb <- cleaned_russell %>%
+  group_by(sector,cap_size) %>%
+  count(sector)%>%
+  arrange(desc(n))
+
+
+# Bar Chart Viz
+ggplot(sector_tb, aes(x = sector, y = n, fill = cap_size)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Company Stocks by Sector and Cap Size",
+    x = "Sector",
+    y = "Count",
+    fill = "Cap Size"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  coord_cartesian(ylim = c(0, 300))
+
+```
+
+```{r Create 3070 split for Confirmatory and Exploratory Datasets, echo=FALSE, output = FALSE, include=FALSE}
+# Randomize the rows
+randomize_russell <- cleaned_russell[sample(nrow(cleaned_russell)), ]
+
+# Then split the data into 30 (exploratory) and 70 (confirmatory)
+split_index <- floor(0.3 * nrow(randomize_russell))
+
+exploratory <- randomize_russell[1:split_index, ]
+confirmatory <- randomize_russell[(split_index + 1):nrow(randomize_russell), ]
+
+# Export as processed data
+# write.csv(confirmatory, "~/lab-2-maroonp005/data/processed/russell3000_confirm.csv", row.names = FALSE)
+# write.csv(exploratory, "~/lab-2-maroonp005/data/processed/russell3000_explore.csv", row.names = FALSE)
+
+dim(exploratory) # 765 Stocks
+dim(confirmatory) # 1787 Stocks
+nrow(exploratory)/nrow(randomize_russell) # Approx. 30% 
+nrow(confirmatory)/nrow(randomize_russell) # Approx. 70%
+```
+
+```{r Read exploratory Russell3000, echo=FALSE, output = FALSE, include=FALSE}
+explore_russell <- read_csv("~/lab-2-maroonp005/data/processed/russell3000_explore.csv", show_col_types=FALSE)
+summary(explore_russell)
+```
+
+```{r Plot relationships between predictors and outcome, echo=FALSE, output = FALSE, include=FALSE}
+explore_russell %>%
+  select(delta_adj_close, cap_size, emp_count, div_action, split_action, delta_vol) %>%
+  GGally::ggpairs(progress = FALSE) +
+  theme(axis.text = element_text(size = 5),
+        axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r Profiling of Outcome Variable,echo=FALSE, output = FALSE, include=FALSE}
+# Boxplot of Delta Adj Close
+bp_adj_close <- ggplot(explore_russell, aes(x = cap_size, y = delta_adj_close, fill = cap_size)) +
+  geom_boxplot() +
+  labs(
+    title = "Delta Adj Close per Cap Size",
+    y = "Delta Adj Close",
+    x = "Cap Size"
+  ) +
+  theme_minimal() +
+  coord_cartesian(ylim = c(-400, 400))
+
+bp_adj_close
+
+# Boxplot of Delta Adj Close All Cap Size
+bp_adj_close_all <- ggplot(explore_russell, aes(x = delta_adj_close)) +
+  geom_boxplot() +
+  labs(
+    title = "Delta Adj Close for All Market Caps",
+    x = "Delta Adj Close"
+  ) +
+  theme_minimal() +
+  coord_cartesian(xlim = c(-400, 400)) +
+  scale_y_continuous(breaks = NULL)
+
+bp_adj_close_all
+
+# Histogram of Delta Adj Close per Cap Size
+hist_adj_close <- ggplot(explore_russell, aes(x = delta_adj_close, fill = cap_size)) +
+  geom_histogram(bins = 30, position = "identity", alpha = 0.7) +
+  facet_wrap(~ cap_size) +  # Create separate histograms for each cap_size
+  labs(
+    title = "Histogram of Delta Adj Close per Cap Size",
+    x = "Delta Adj Close",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  coord_cartesian(ylim = c(0, 800))
+
+hist_adj_close
+
+# Histogram of Delta Adj Close All Cap Size
+hist_adj_close_all <- ggplot(explore_russell, aes(x = delta_adj_close)) +
+  geom_histogram(bins = 100, position = "identity", alpha = 0.7) +
+  labs(
+    title = "Histogram of Delta Adj Close",
+    x = "Delta Adj Close",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  coord_cartesian(ylim = c(0, 800))
+
+hist_adj_close_all
+```
+
+```{r Deeper Diver into Metric Predictors Profiles (histogram),echo=FALSE, output = FALSE, include=FALSE}
+
+## ADJUSTED CLOSE
+# Original
+p1 <- explore_russell %>%
+  ggplot(aes(x = delta_adj_close)) +
+  geom_histogram(bins = 50) +
+  theme_minimal() +
+  labs(title = "Histogram of Delta Adj Close", x = "Delta Adj Close", y = "Count")
+p1
+
+# Exploring log
+p1_1 <- explore_russell %>%
+  mutate(log_delta_adj_close = log(abs(delta_adj_close))) %>%
+  ggplot(aes(x = log_delta_adj_close)) +
+  geom_histogram(bins = 50) +
+  theme_minimal() +
+  labs(title = "Histogram of Log Abs Delta Adj Close", x = "Log Abs Delta Adj Close", y = "Count")
+p1_1
+
+# Exploring squared
+p1_2 <- explore_russell %>%
+  mutate(sq_delta_adj_close = delta_adj_close^2) %>%
+  ggplot(aes(x = sq_delta_adj_close)) +
+  geom_histogram(bins = 50) +
+  labs(title = "Histogram of Squared Delta Adj Close", x = "Squared Delta Adj Close", y = "Count")
+p1_2
+
+## EMPLOYEE COUNT
+# Original
+p2 <- explore_russell %>%
+  ggplot(aes(x = emp_count)) +
+  geom_histogram(bins = 50) +
+  labs(title = "Histogram of Employee Count", x = "Employees", y = "Count")
+p2
+
+# Exploring log
+p2_1 <- explore_russell %>%
+  mutate(log_emp_count = log(emp_count)) %>%
+  ggplot(aes(x = log_emp_count)) +
+  geom_histogram(bins = 50) +
+  labs(title = "Histogram of Log Employee Count", x = "Log Employees", y = "Count")
+p2_1
+
+# Exploring Squared
+p2_2 <- explore_russell %>%
+  mutate(sq_emp_count = emp_count^2) %>%
+  ggplot(aes(x = sq_emp_count)) +
+  geom_histogram(bins = 50) +
+  labs(title = "Histogram of Sq Employee Count", x = "Sq Employees", y = "Count")
+p2_2
+
+## Delta Trading Volume
+# Original
+p3 <- explore_russell %>%
+  ggplot(aes(x = delta_vol)) +
+  geom_histogram(bins = 50) +
+  labs(title = "Histogram of Delta Volume", x = "Delta Volume", y = "Count")
+p3
+
+# Exploring Squared
+p3_1 <- explore_russell %>%
+  mutate(sq_delta_vol = delta_vol^2) %>%
+  ggplot(aes(x = sq_delta_vol)) +
+  geom_histogram(bins = 50) +
+  labs(title = "Histogram of Sq Delta Volume", x = "Sq Delta Volume", y = "Count")
+p3_1
+```
+
+```{r Plot relationships with log predictors and outcomes,echo=FALSE, output = FALSE, include=FALSE}
+# Skewedness and heavy tails on adjusted close, delta volume, and employee count. Log of adjusted close, delta volume, and employee count created more normalized values. Remaining predictors are categorical/binary.
+# We did not continue with log of absolute delta adj close or trading volume as we would lose the direction (positive/negative) -- possibly would need to explore signage in the future
+log_delta_adj_close <- log(abs(explore_russell$delta_adj_close))
+log_emp_count <- log(explore_russell$emp_count)
+log_dvol <- log(explore_russell$delta_vol)
+explore_russell %>%
+  mutate(log_emp_count = log_emp_count, log_dvol = log_dvol) %>%
+  select(delta_adj_close, cap_size, log_emp_count, div_action, split_action, log_dvol) %>%
+  GGally::ggpairs(progress = FALSE) +
+  theme(axis.text = element_text(size = 5),
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Warnings indicate values of log(0)
+```
+
+```{r Prepare exploratory data for log functions, echo=FALSE, output = FALSE, include=FALSE}
+
+# Set values for employee count to 1 as 0 employees is impossible and log(1) = 0. This would ensure the other variables are not affected.
+
+explore_russell_filtered <- explore_russell
+explore_russell_filtered$emp_count <- ifelse(explore_russell_filtered$emp_count == 0, 1, explore_russell_filtered$emp_count)
+explore_russell_filtered$delta_vol <- ifelse(explore_russell_filtered$delta_vol == 0, 1, explore_russell_filtered$delta_vol)
+
+colSums(!is.na(explore_russell_filtered))
+```
+
+```{r echo=FALSE, output = FALSE, include=FALSE}
+###explore_russell_filter_emp \<- explore_russell[explore_russell\$emp_count \> 0, ] colSums(!is.na(explore_russell_filter_emp))
+
+###explore_russell_filter_vol \<- explore_russell_filter_emp[explore_russell_filter_emp\$delta_vol \> 0, ] colSums(!is.na(explore_russell_filter_vol))
+
+```
+
+```{r Base Model Passes on Each Predictor Variable, echo=FALSE, output = FALSE, include=FALSE}
+
+## Sector
+model_sector <- lm(delta_adj_close~sector,data=explore_russell_filtered)
+coeftest(model_sector,vcov=vcovHC(model_sector))
+
+# Cap Size
+model_cap_size <- lm(delta_adj_close~cap_size,data=explore_russell_filtered)
+coeftest(model_cap_size,vcov=vcovHC(model_cap_size))
+
+# Employee Count
+model_emp <- lm(delta_adj_close~emp_count,data=explore_russell_filtered)
+coeftest(model_emp ,vcov=vcovHC(model_emp ))
+
+# Log Employee Count
+model_log_emp <- lm(delta_adj_close ~ log(emp_count), data = explore_russell_filtered)
+coeftest(model_log_emp, vcov = vcovHC(model_log_emp))
+
+# Delta Volume
+model_dvol <- lm(delta_adj_close~delta_vol,data=explore_russell_filtered)
+coeftest(model_dvol,vcov=vcovHC(model_dvol))
+
+# Dividend Action
+model_div_action <- lm(delta_adj_close~div_action,data=explore_russell_filtered)
+coeftest(model_div_action,vcov=vcovHC(model_div_action))
+
+# Split Action
+model_split_action <- lm(delta_adj_close~split_action,data=explore_russell_filtered)
+coeftest(model_split_action,vcov=vcovHC(model_split_action))
+
+```
+
+```{r First Model after Base Model Analysis, echo=FALSE, output = FALSE, include=FALSE}
+
+model_one <- lm(delta_adj_close~sector+cap_size,data=explore_russell_filtered)
+coeftest(model_one,vcov=vcovHC(model_one))
+
+# Null hypothesis rejections
+# Sectors: Consumer Discretionary, Energy, Industrials, IT, Materials
+# Cap Size: Medium Cap, Small Cap
+```
+
+```{r Second Model after Base Model Analysis, echo=FALSE, output = FALSE, include=FALSE}
+
+model_two <- lm(delta_adj_close~sector+cap_size+log(emp_count),data=explore_russell_filtered)
+coeftest(model_two, vcov = vcovHC(model_two))
+
+# Null hypothesis rejections
+# Sectors: Consumer Discretionary, Energy, Industrials, IT, Materials
+# Cap Size: Medium Cap, Small Cap
+# Same as previous model. It seems that employee count no longer has an effect.
+```
+
+```{r Third Model with Interaction Term,echo=FALSE, output = FALSE, include=FALSE}
+
+model_three <- lm(delta_adj_close~sector+cap_size+log(emp_count)+I(log(abs(delta_vol))*log(emp_count)),data=explore_russell_filtered)
+coeftest(model_three, vcov = vcovHC(model_three))
+
+# Null hypothesis rejections
+# Sectors: Consumer Discretionary, Energy, Industrials, IT, Materials
+# Cap Size: Medium Cap, Small Cap
+# Same as previous model. It seems that interaction terms don't have an effect either.
+```
+
+```{r Evaluate statistically significant differences between means of independent variable groups using ANOVA, echo=FALSE, output = FALSE, include=FALSE}
+
+anova(model_cap_size,model_sector)
+## Null hypothesis: There is no difference between using only cap size or only sector to forecast the difference in the adjusted close price (ACP) in Trump's first 60 days
+## Results: Using the P value and the F stat show there is a significant difference between using. cap size or sector to forecast the (ACP) indicating that sector has a smaller sum of squares
+
+anova(model_one, model_sector)
+## Null Hypothesis: There is no difference between model_one and looking only at the sector to forecast the difference in the adjusted close price in Trump's first 60 days
+## Results: Null hypothesis is rejected, model_one is a lower RSS meaning that there is a significant difference between the 2 models, adding cap-size to sector significantly improves the model
+
+anova(model_one, model_cap_size)
+## Null Hypothesis: There is no difference between model_one and looking only at the capsize to forecast the difference in the adjusted close price in Trump's first 60 days
+## Results: Null hypothesis is rejected, model_one is a lower RSS meaning that there is a significant difference between the 2 models, adding cap-size to sector significantly improves the model
+
+anova(model_two, model_one)
+## Null hypothesis: There is no difference between using or not using log(emp_count) to forecast the difference in the adjusted close price (ACP) in Trump's first 60 days
+## Results: Fail to reject null hypothesis - log(emp_count) does not make a difference in forecast
+
+# Model 3 shows no discrepancies so anova was not used.
+```
+
+# Introduction
+
+The performance of stocks can shift rapidly in response to presidential administration changes, and since Trump’s inauguration on Jan 20th, there has been a highlighted focus on the stock market’s performance and concerns about the future outlook. With the stock market as a critical backbone of the U.S. economy, prior research has extensively explored stock market reactions to major events, and financial algorithms have been continuously refined. However, there has been little analysis of how company-specific traits and strategic responses - in the form of corporate actions - are together associated with stock performance during politically uncertain times. This study aims to investigate the combination of company characteristics and actions on market capitalization changes within the Russell 3000 during the initial 60 days of the Trump administration. Examining the first 60 days of the administration allows for an early-term analysis, offering timely insights into influential factors while providing a long enough window to reduce short-term volatility and noise across individual stock performance. To better understand how company-specific factors correlate with early market reactions under this new political leadership, our team is focusing on the following questions: 
+
+> *In the first 60 days of the Trump administration, are there any company characteristics that correlate with the 60-day price change of the stock?\
+> \
+> Do certain characteristics have a higher correlation with price change than others?*
+
+To answer these questions, using the classical linear model, our team will statistically analyze which company characteristics are associated with differences in market capitalization trends during this period. Our outcome variable (Y) is the 60-day net change in adjusted closing prices, and our covariates (Xs) are sector, cap size, employee count, trading volume, and corporate actions. Understanding how company characteristics correlate with stock responses can offer insight into market trends, helping inform strategic decisions within a company, and helping investors react during times of uncertainty or economic turbulence. 
+
+# Data Source Description
+
+Our analysis uses company-level data from three main sources: the iShares BlackRock list of Russell 3000 constituents, the Yahoo Finance API (via the yfinance Python package), and CompaniesMarketCap.com. Data was collected in April 2025 and includes observations from January 21 to March 21, 2025, covering the first 60 days of the Trump administration.
+
+The Russell 3000 index is a collection of stocks for US-based companies that represent approximately 98% of the American public equity market. The index is created and maintained by FTSE Russell, an organization that builds and manages stock market indexes. The index includes 3,000 of the largest publicly traded U.S. companies, spanning large-cap, mid-cap, and small-cap stocks. This index serves as a comprehensive benchmark for the overall performance of the U.S. stock market and was gathered using iShares BlackRock.
+
+The Yahoo Finance API is a service that provides access to a wide range of financial data, including stock prices, historical market data, company information, and financial news. The API allows users to pull data on stock information and performance in mass. Features that were pulled included company info, such as sector and industry, and daily financial information, such as marketCap.
+
+CompaniesMarketCap.com is a financial data platform that ranks over 10,000 publicly traded companies by market capitalization, offering insights into global corporate valuations. It provides useful financial data such as a company’s market capitalization, earning, revenue, and more.
+
+# Data Wrangling
+
+We constructed a broad dataset for the Russell 3000 by integrating data from Yahoo Finance API (yfinance package), iShares BlackRock, and CompaniesMarketCap. The BlackRock dataset provided the official list of Russell 3000 tickers and their sector classifications. The Yahoo Finance API was used to pull historical stock data—specifically, the adjusted closing prices at the beginning and end of the 60-day window. These values were used to calculate the net price change. We also retrieved dividend and split activity indicators (using 1 = occurred and 0 = did not occur) during the same window. Employee counts were retrieved from CompaniesMarketCap.com via manual lookup, which were then merged by ticker. Due to resource limitations in DataHub Rstudio, much of the data extraction was done locally. Because stock data is time series-based, we consolidated the measurements into a cross-section of single rows for each stock with standardized features for the same period. The first and final adjusted closing prices were used to calculate the 60-day net change and to indicate if any splits and dividends occurred (using 1 = yes and 0 = no). We then merged the dataset with the CompaniesMarketCap data to assign the number of full-time employees for each company. With the focus being on the first 60 days after Trump’s inauguration, we used the Yahoo Finance API to pull the adjusted closing prices, all company actions (splits and dividends), and market capitalizations, which helped us to derive the cap sizes during this period.
+
+The following table displays the adjustments we made to the datasets prior to building our models. The initial dataset from BlackRock contained 2676 stocks of different market cap sizes (small, medium, large). The limitations of using the free Yahoo Finance API resulted in incomplete data capture, in which 121 stocks had missing or unavailable information for all predictors. As such, these 121 samples were removed when joining the two datasets based on stock symbols, which could have introduced bias if these exclusions are non-random. From here, the final dataset was split by a ratio of approximately 30:70 to create a exploratory dataset for model engineering and a confirmatory dataset to evaluate final results. Additionally, we removed 3 stocks that had null values for market cap, as this meant that the predictor variable cap size would also be null, leaving us with a total of 2552 data points.
+
+|             |                                |                 |                 |
+|-----------------|-----------------------|-----------------|-----------------|
+| Sample Size | Filter                         | Removed Samples | End Sample Size |
+| 2676        | Unavailable Data from YFin API | 121             | 2555            |
+| 2555        | Missing Values in `market_cap` | 3               | 2552            |
+| 2552        | Subset to Exploratory Dataset  | 0               | 765             |
+| 2552        | Subset to Confirmatory Dataset | 0               | 1787            |
+
+# Operationalization
+
+Our null hypothesis for this analysis is that characteristics for companies in the in the Russell 3000, including sector, employee count, dividend and split action, net change in trading volume, and cap size (based on market cap), did not have a statistically significant impact on net change in adjusted close amount (calculated using the difference of adjusted start and end close amount in dollars) during the first 60 days of the Trump Administration. Prior research suggested that firms of varying size and industry respond differently to changes during politically sensitive periods. Employee count serves as a proxy for company scale, and corporate actions often signal information to investors.
+
+We ran a series of single-variable linear regressions to reject the null hypothesis and identify significance (Figure 1). For each regression we checked significance with the `coefest` to look at both t and p-values. Using this method, we found significance in sector, capsize, and natural log of employee count. However, when combining these terms, natural log of employee count no longer had any effect on the overall model. From our testing results, we ended up using Sector and Cap Size as our predictors to create our final linear model and ran an ANOVA against our other models, confirming that the sum of squares was lowest for the linear model with both Sector and Capsize. We then tested the Model Assumptions to confirm if this model meets those expectations and how to derive a better fit . 
+
+In the future, we hope to continue segmenting this information to further understand attributes that have the biggest impact on the net change in close price during the Trump administration.
+
+# Data Visualization
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=8, fig.height=3}
+## Creating Predicted Values by Residual Value Graphs  
+
+shrink_theme <- theme(
+  plot.title = element_text(size = 12,hjust=0.5),
+  axis.title = element_text(size = 11),
+  axis.text = element_text(size = 11)
+)
+
+t1 <- explore_russell %>%
+  mutate(
+    m_sector_preds = predict(model_sector),
+    m_sector_resids = resid(model_sector)
+  ) %>%
+  ggplot(aes(m_sector_preds, m_sector_resids)) +
+  geom_point() +
+  stat_smooth(method = "loess") +
+  labs(title = "Sector", x = "Predicted Value ($)", y = "Residuals ($)")
+
+t2 <- explore_russell %>%
+  mutate(
+    m_cap_size_preds = predict(model_cap_size),
+    m_cap_size_resids = resid(model_cap_size)
+  ) %>%
+  ggplot(aes(m_cap_size_preds, m_cap_size_resids)) +
+  geom_point() +
+  stat_smooth(method = "loess") +
+  labs(title = "Cap Size", x = "Predicted Value ($)", y = "Residuals ($)")
+
+t3 <- explore_russell %>%
+  mutate(
+    m_ecount_preds = predict(model_emp),
+    m_ecount_resids = resid(model_emp)
+  ) %>%
+  ggplot(aes(m_ecount_preds, m_ecount_resids)) +
+  geom_point() +
+  stat_smooth(method = "loess") +
+  labs(title = "Employee Count", x = "Predicted Value ($)", y = "Residuals ($)")
+
+t4 <- explore_russell %>%
+  mutate(
+    m_d_vol_preds = predict(model_dvol),
+    m_d_vol_resids = resid(model_dvol)
+  ) %>%
+  ggplot(aes(m_d_vol_preds, m_d_vol_resids)) +
+  geom_point() +
+  stat_smooth(method = "loess") +
+  labs(title = "Change in Volume", x = "Predicted Value ($)", y = "Residuals ($)")
+
+t5 <- explore_russell %>%
+  mutate(
+    m_div_action_preds = predict(model_div_action),
+    m_div_action_resids = resid(model_div_action)
+  ) %>%
+  ggplot(aes(m_div_action_preds, m_div_action_resids)) +
+  geom_point() +
+  stat_smooth(method = "loess") +
+  labs(title = "Dividend Action", x = "Predicted Value ($)", y = "Residuals ($)")
+
+t6 <- explore_russell %>%
+  mutate(
+    m_split_action_preds = predict(model_split_action),
+    m_split_action_resids = resid(model_split_action)
+  ) %>%
+  ggplot(aes(m_split_action_preds, m_split_action_resids)) +
+  geom_point() +
+  stat_smooth(method = "loess") +
+  labs(title = "Stock Split Action", x = "Predicted Value ($)", y = "Residuals ($)")
+
+# Combine all plots into one display
+t1 + t2 + t3 + t4 + t5 + t6 + plot_layout(nrow = 2) + plot_annotation(title = "Figure 1: Single-Variable Linear Regression Exploration")
+
+```
+
+```{r,echo=FALSE, warning=FALSE, message=FALSE, fig.width=8, fig.height=3}
+
+## Creating Predicted Values by Residual Value Graphs  
+
+shrink_theme <- theme(
+  plot.title = element_text(size = 14,hjust=0.5),
+  axis.title = element_text(size = 14),
+  axis.text = element_text(size = 14)
+)
+
+fitted_vals <- fitted(model_one)
+residuals_vals <- resid(model_one)
+
+# Create the custom plot
+plot(fitted_vals, residuals_vals,
+     xlab = "Fitted Values",
+     ylab = "Residuals ($)",
+     main = "Figure 2: Residuals ($) vs Fitted Values",
+     sub = "Model: Delta Adjusted Close ($) ~ Sector + Cap Size",
+     pch = 20,
+     col = "steelblue")
+abline(h = 0, col = "red", lty = 2)
+
+```
+
+# Model Specifications
+
+We found sector and cap size were the most relevant descriptors of the delta net adjusted close price after looking at linear regressions for each individual attribute. This was confirmed as the residual sum of squares was the lowest for these two characteristics compared to all other individual linear regressions. A review of model assumptions indicated heavy tails on both sides in the QQ plot and a kurtosis of \> 400 and skewness of -18, indicating the data is leptokurtic.
+
+While log transformations were considered to reduce skew, they were not feasible due to the nature of stocks and the importance of knowing if the net change in adjusted closing price was negative or positive. Around 3% of data had a Cook’s Distance of 4/n and considered influential observations. Of these, we found they were more heavily weighted in the Large Cap sectors of Industrials, IT, and Consumer Discretionary. In a future study, it may be prudent to isolate these groups and continue to investigate why they may act more positively or negatively during this time period. As our data for all models was highly leptokurtic, we opted to use the coeftest with robust standard errors, which would more accurately reflect the data.
+
+```{r, echo=FALSE, output = FALSE, include=FALSE}
+# Final Models and Confirmation Data
+# Apply confirmatory data on models
+confirm_russell <- read_csv("~/lab-2-maroonp005/data/processed/russell3000_confirm.csv", show_col_types=FALSE)
+confirm_russell <- confirm_russell
+confirm_russell$emp_count <- ifelse(confirm_russell$emp_count == 0, 1, confirm_russell$emp_count)
+m_sector <- lm(delta_adj_close~sector, data=confirm_russell)
+m1 <- lm(delta_adj_close~sector+cap_size, data=confirm_russell)
+
+# Filtering pvals
+m_sector_summary <- coef(summary(m_sector))[,4]
+se_sector <- sqrt(diag(vcovHC(m_sector)))
+se1 <- sqrt(diag(vcovHC(m1)))
+
+print(length(coef(m_sector)))
+print(length(se_sector))
+print(length(coef(m1)))
+print(length(se1))
+```
+
+```{r, echo = FALSE, message = FALSE, results = 'asis', warning=FALSE, float = FALSE}
+cat("\\begin{center}\\small\n")
+stargazer(m_sector, m1,
+          type = "latex",
+          title = "Confirmatory Model Results",
+          se = list(se_sector, se1),
+          dep.var.labels = "Net Change in Adjusted Close",
+          omit = c(
+            "sectorConsumer Staples", 
+            "sectorHealth Care", 
+            "sectorReal Estate", 
+            "sectorUtilities"
+            ),
+          covariate.labels = c(
+            "Sector: Consumer Discretionary",
+            "Sector: Energy", 
+            "Sector: Financials", 
+            "Sector: Industrials",
+            "Sector: Information Technology",
+            "Sector: Materials",
+            "Cap Size: Medium Cap",
+            "Cap Size: Small Cap",
+            "Constant")
+          )
+cat("\\end{center}\n")
+```
+
+# Model Assumptions
+
+*IID:* All stocks in the Russell 3000 are impacted by economic factors, decisions and instability. Some stocks may also relate to others, e.g. if you sell your shares for one stock, you may be selling all stocks you own. The residuals have a discernible pattern, suggesting that constant variance is not met. Therefore, it is not IID.
+
+```{r Plot Regression of Chosen Predictor Base Models, echo=FALSE, warning=FALSE, message=FALSE, output = FALSE, include=FALSE, fig.width=12, fig.height=6}
+
+## Creating Predicted Values by Residual Value Graphs  
+
+shrink_theme <- theme(
+  plot.title = element_text(size = 12,hjust=0.5),
+  axis.title = element_text(size = 11),
+  axis.text = element_text(size = 11)
+)
+
+
+
+# Sector Model
+t1 <- explore_russell_filtered %>%
+  mutate(
+    model_sector_preds = predict(model_sector),
+    model_sector_resids = resid(model_sector)
+  ) %>%
+  ggplot(aes(model_sector_preds, model_sector_resids)) +
+  geom_point() +
+  stat_smooth(method = "loess") +
+  labs(
+    title = "Sector Base",
+    x = "Fitted Values (Pred. Delta Adj. Close)",
+    y = "Residuals ($)"
+  )
+
+# Cap Size Model
+t2 <- explore_russell_filtered %>%
+  mutate(
+    model_cap_size_preds = predict(model_cap_size),
+    model_cap_size_resids = resid(model_cap_size)
+  ) %>%
+  ggplot(aes(model_cap_size_preds, model_cap_size_resids)) +
+  geom_point() +
+  stat_smooth(method = "loess") +
+  labs(
+    title = "Cap Size",
+    x = "Fitted Values (Pred. Delta Adj. Close)",
+    y = "Residuals ($)"
+  )
+
+# Log Employee Count Model
+t3 <- explore_russell_filtered %>%
+  mutate(
+    model_log_emp_preds = predict(model_log_emp),
+    model_log_emp_resids = resid(model_log_emp)
+  ) %>%
+  ggplot(aes(model_log_emp_preds, model_log_emp_resids)) +
+  geom_point() +
+  stat_smooth(method = "loess") +
+  labs(
+    title = "Log Employee",
+    x = "Fitted Values (Pred. Delta Adj. Close)",
+    y = "Residuals ($)"
+  )
+
+# Combine the plots
+t1 + t2 + t3 + plot_layout(nrow = 2)
+```
+
+*Linear Conditional Expectation:* To confirm linearity and conditional expectation, we plotted the residuals against the best-fit line. This confirmed linearity but also identified several significant outliers. We further investigated these outliers in another section below.
+
+```{r Histogram of the Delta Adjusted Close and Residuals,echo=FALSE, output=FALSE, include=FALSE}
+# There are significant tails on both histograms
+
+df <-data.frame(
+  del_close = explore_russell$delta_adj_close,
+  residuals = resid(model_one)
+)
+
+#histogram for delta_close
+h1 <- ggplot(df,aes(x=del_close))+
+  geom_histogram(binwidth = 15,fill="purple",color = "black")+
+  ggtitle("Hist. Adj Close First 60")+
+  theme_minimal()
+
+
+#histogram for residuals
+h2 <- ggplot(df,aes(x=residuals))+
+  geom_histogram(binwidth = 15,fill="darkgreen",color = "black")+
+  ggtitle("Hist. Adj Close First 60, Residuals")+
+  theme_minimal()
+
+#create image
+grid.arrange(h1,h2,nrow=1)
+```
+
+*No Perfect Collinearity:* To confirm no collinearity, we looked at the variance inflation factor and saw that the VIF is \<5 and closer to 1, meeting the requirement that the data is not collinear.
+
+```{r Variance Inflation Factor of Model 1, echo=FALSE, output=FALSE, include=FALSE}
+## variance inflation factor
+vif(model_one)
+vif(model_one)>4
+```
+
+*Homoskedastic Errors:* QQ-Plot, Plot scale-location model, PB test, skewness, and kurtosis were analyzed and indicated heavy tails, which was further confirmed through a kurtosis of \> 400 and a skewness of -18. This indicates that our data is heteroskedastic and leptokurtic and does not meet the requirements of the CLM.
+
+```{r, echo=FALSE, output = FALSE, include=FALSE}
+kurtosis(model_one$residuals)-3 #Fischer
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+skewness(model_one$residuals)
+```
+
+*Normally Distributed Errors:* The QQ Plot showed that errors are mostly equally distributed, however there are still significant outliers.
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+hist(model_one$residuals, breaks = 10, main = "Residuals from Linear Model Delta Close Price")
+```
+
+*Results:* This provided us with enough information to identify that the CLM may not be the best model due to the outliers. We had several options on how to address this and decided to dive deeper into further investigation at this point.
+
+### Model Results and Interpretation
+
+When looking at the 60-day net change in the adjusted closing price, our final confirmatory model rejects the null hypothesis and indicates that both variables of sector and cap size are relevant descriptors of the delta net adjusted close price. However, due to the low R2 value, these descriptors do not fully explain the model. We believe that this is due to not meeting homoskedastic assumptions with leptokurtic data. Cooks Distance confirmed these outliers do impact the model.  Of all the models we studied (single variable and multi-variable linear regressions), the model including sector and cap size had the lowest Residual Sum of Squares in the ANOVA test.
+
+In the combined model, some sectors had a negative coefficient, contributing to an increased change in the negative direction when compared to baseline. When looking at the medium cap and small cap, however, both had positive coefficients. This indicates that mid-cap and small-cap stocks typically experienced higher average net gains than large-cap stocks in the first 60 days of President Trump's tenure.
+
+To improve this model, we took the log of the employee count to account for heteroskedasticity, modeled linearity for each variable individually. However, taking the net change in the net delta change omits the sign of the change in close price. We tested applying the log for employee count, however Sector and Cap Size were still more significant. An outlier investigation indicated around 3% of the data had a Cooks Distance \> 4/n. These data are comprised disproportionately of Large Cap stocks in the sectors of Industrials and IT.
+
+For next steps we would suggest modeling Large Cap Industrials and IT alone, including a variable for the signage (positive/negative) of the net change in adjusted closing price, then taking the log of the absolute value. Other model types may reflect a more accurate R2 for these data which is worth exploring. Finally, incorporating specific firms or macroeconomic variables may also capture more short-term volatility.
+
+In conclusion, our model suggests that sector and cap size are correlated with the 60-day net change in adjusted closing price, however these descriptor variables are not comprehensive leading to the low R2. Generally, smaller cap firms fared better than large cap firms, and some sectors have better performance than others. 
+
+Practical significance of this model suggest that sectors of Industrials (-\$14) and IT (-\$12) are significantly more negatively correlated by the current political climate. However, we see the small cap stocks actually rose (\$8). It is important to recognize that while these variables had a low p-value and were considered very significant, the overall R value of the regression was low meaning that while some industrials and IT did drop and small cap, this is not guaranteed as not all effects are accounted for. However, the limited R2 and multiple outliers indicate that these results do not describe everything that was happening during this 60 day period.
+
+\newpage
+
+# Appendix
+
+### A Link to your Data Source:
+
+<https://github.com/mids-w203/lab-2-maroonp005/data/external>
+
+### A List of Model Specifications we Tried:
+
+To start we looked at each variable individually and built a linear model for that variable. This allowed us to clearly see which beta variables may most impact the net delta adjusted close. That let us isolate which variables individually had the largest impact on the net delta change.
+
+\begin{center} 
+
+\textbf{Base Models:}
+$$revenue = \beta_0 + \beta_1 \cdot sector + \epsilon$$
+$$revenue = \beta_0 + \beta_1 \cdot cap\ size + \epsilon$$
+$$revenue = \beta_0 + \beta_1 \cdot employee\ count + \epsilon$$
+$$revenue = \beta_0 + \beta_1 \cdot \ln(employee\ count) + \epsilon$$
+$$revenue = \beta_0 + \beta_1 \cdot \Delta\ trading\ volume + \epsilon$$
+$$revenue = \beta_0 + \beta_1 \cdot dividend + \epsilon$$
+$$revenue = \beta_0 + \beta_1 \cdot split + \epsilon$$
+
+
+\textbf{Model 1:} $$revenue = \beta_0 + \beta_1 \cdot sector + \beta_2 \cdot cap\ size + \epsilon$$
+
+\textbf{Model 2:} $$revenue = \beta_0 + \beta_1 \cdot sector + \beta_2 \cdot cap\ size + \beta_3 \cdot \ln(full\ time\ employees) + \epsilon$$
+
+\textbf{Final Model:} $$revenue = \beta_0 + \beta_1 \cdot sector + \beta_2 \cdot cap\ size + \epsilon$$
+\end{center}
+
+### A Residuals-vs-Fitted-values Plot:
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=8, fig.height=4}
+
+## Creating Predicted Values by Residual Value Graphs  
+
+shrink_theme <- theme(
+  plot.title = element_text(size = 14,hjust=0.5),
+  axis.title = element_text(size = 14),
+  axis.text = element_text(size = 14)
+)
+
+
+confirm_fitted_vals <- fitted(m1)
+confirm_residuals_vals <- resid(m1)
+
+# Create the custom plot
+plot(confirm_fitted_vals, confirm_residuals_vals,
+     xlab = "Fitted Values($)",
+     ylab = "Residuals ($)",
+     main = "Residuals vs Fitted Values",
+     sub = "Model: Net Delta of Adjusted Close ($) ~ Sector + Cap Size",
+     pch = 20,
+     col = "steelblue")
+abline(h = 0, col = "red", lty = 2)
+```
+
+```{r,eval=FALSE, echo=FALSE, output = FALSE, include=FALSE}
+# Investigating Heavy Tails
+#Calculating Cook's Distance to identify datapoints that have a large impact on the regression coefficients
+sort(cooksD, decreasing = TRUE)[1:5]
+
+# Plot
+plot(cooksD, type = "h", main = "Cook's Distance", ylab = "Cook's D")
+abline(h = 4 / nrow(explore_russell), col = "red", lty = 2)  # Common cutoff
+```
+
+```{r, echo=FALSE, output = FALSE, include=FALSE}
+#Adding Cook's Distance to the DF for analysis
+explore_russell_cooks_d<-explore_russell
+cooks_d<-cooks.distance(model_one)
+explore_russell_cooks_d$cooks_distance<-cooks_d
+head(explore_russell_cooks_d)
+
+```
+
+```{r, echo=FALSE, output = FALSE, include=FALSE}
+# Generate residuals
+confirm_residuals_vals <- resid(m1)
+
+# Create QQ plot
+qqnorm(confirm_residuals_vals,
+       main = "QQ Plot of Residuals",
+       xlab = "Theoretical Quantiles",
+       ylab = "Sample Residuals ($)",
+       pch = 20,
+       col = "steelblue")
+qqline(confirm_residuals_vals, col = "red", lty = 2)
+```
+
+```{r, echo=FALSE, output = FALSE, include=FALSE}
+
+n <- nrow(explore_russell_cooks_d)
+filtered_df <- explore_russell_cooks_d %>%
+  filter(cooks_distance >= 4 / n)%>%
+  arrange(delta_adj_close)
+ 
+
+filtered_df %>%
+  head(60)
+
+
+#2.3% total of stocks that fall outside of cook's d, affecting the algorithm
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+
+filtered_df %>%
+  count(sector)%>%
+  arrange(desc(n))
+
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+
+filtered_df %>%
+  count(cap_size)%>%
+  arrange(desc(n))
+
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+
+explore_russell %>%
+  count(cap_size)%>%
+  arrange(desc(n))
+
+
+#Large Cap: 8.33% Small Cap: \< 1% Medium cap 2.91%
+#Industrials = 4.77% IT = 4.62% Consumer Discretionary 4.22%
+#certian larger cap IT and industrials are more significant outliers causing ....
+
+
+
+```
+
+```{r, echo=FALSE, output = FALSE, include=FALSE}
+
+explore_russell %>%
+  count(sector)%>%
+  arrange(desc(n))
+
+```
+
+```{r, echo=FALSE, output = FALSE, include=FALSE}
+
+filtered_df %>%
+  count(cap_size)%>%
+  arrange(desc(n))
+
+```
+
+```{r, echo=FALSE, output = FALSE, include=FALSE}
+
+## Running Confirmatory Model
+confirmatory_model <- lm(delta_adj_close~sector+cap_size,data=confirm_russell)
+coeftest(confirmatory_model,vcov=vcovHC(confirmatory_model))
+
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+# Testing Confirmatory Model against CLM assumptions
+
+plot(confirmatory_model)
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+
+confirmatory %>% 
+  mutate(
+    confirmatory_model_preds = predict(confirmatory_model), 
+    confirmatory_model_resids = resid(confirmatory_model)
+  ) %>% 
+  ggplot(aes(confirmatory_model_preds, confirmatory_model_resids)) + 
+  geom_point() + 
+  stat_smooth()
+
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+hist(confirmatory_model$residuals, breaks = 10, main = "Residuals from Confirmatory Linear Model Delta Close Price")
+
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+
+# Using Cook's Distance to explore outliers
+# Calculating Cook's Distance to identify datapoints that have a large impact on the regression coefficients
+
+confirm_cooksD<-cooks.distance(confirmatory_model)
+sort(confirm_cooksD, decreasing = TRUE)[1:5]
+
+# Plot
+plot(confirm_cooksD, type = "h", main = "Cook's Distance", ylab = "Cook's D")
+abline(h = 4 / nrow(confirmatory), col = "red", lty = 2)  # Common cutoff
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+
+confirmatory_cooks_d<-confirmatory
+
+confirmatory_cooks_d$cooks_distance<-cooks.distance(confirmatory_model)
+head(confirmatory_cooks_d)
+
+```
+
+```{r, echo=FALSE, output = FALSE, include=FALSE}
+
+n <- nrow(confirmatory_cooks_d)
+
+filtered_df_confirmatory <- confirmatory_cooks_d %>%
+  filter(cooks_distance >= 4 / n) %>%
+  arrange(desc(cooks_distance))
+
+head(filtered_df_confirmatory,60)
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+filtered_df_confirmatory%>%
+  count(sector)%>%
+  arrange(desc(n))
+
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+nrow(filtered_df_confirmatory)/nrow(confirmatory)*100
+
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+print(nrow(confirmatory))
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+nrow(filtered_df_confirmatory)
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+nrow(filtered_df_confirmatory)/nrow(confirmatory)*100
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+confirmatory%>%
+  count(cap_size)%>%
+  arrange(desc(n))
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+filtered_df_confirmatory%>%
+  count(cap_size)%>%
+  arrange(desc(n))
+```
+
+```{r,echo=FALSE, output = FALSE, include=FALSE}
+skewness(confirmatory_model$residuals)
+```
